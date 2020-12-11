@@ -10,6 +10,7 @@ import shutil
 import time
 import warnings
 import PIL
+import math
 
 import torch
 import torch.nn as nn
@@ -24,14 +25,35 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from torch.cuda.amp import autocast
+from torch.cuda.amp import GradScaler
+
+# import horovod
+try:
+    import horovod.torch as hvd
+except ModuleNotFoundError:
+    print('horovod is not installed')
+
+import sys
+sys.path.append('./')
+
 from efficientnet_pytorch import EfficientNet
 
+
+## DDP
+# python -m torch.distributed.launch --nproc_per_node=1 examples/imagenet/main.py --data /data/image/ -a efficientnet-b0 --multiprocessing-distributed
+## horovod
+# horovodrun -np 4 python examples/imagenet/main.py --data /data/image/ -a efficientnet-b0 --use-horovod
+
+# from torch.utils.tensorboard import SummaryWriter
+# writer = SummaryWriter('runs/imagenet_DDP')
+
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR',
+parser.add_argument('--data', metavar='DIR',
                     help='path to dataset')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--n-workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -57,11 +79,11 @@ parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
                     help='use pre-trained model')
-parser.add_argument('--world-size', default=-1, type=int,
+parser.add_argument('--world_size', default=-1, type=int,
                     help='number of nodes for distributed training')
 parser.add_argument('--rank', default=-1, type=int,
                     help='node rank for distributed training')
-parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+parser.add_argument('--dist-url', default='env://', type=str,
                     help='url used to set up distributed training')
 parser.add_argument('--dist-backend', default='nccl', type=str,
                     help='distributed backend')
@@ -79,8 +101,14 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-best_acc1 = 0
+parser.add_argument('--local_rank', default=-1, type=int, help='local rank')
+parser.add_argument('--use-horovod', default=False, action='store_true', help='use horovod')
+parser.add_argument('--mixed-precision', default=False, action='store_true', help='use mixed procision')
+parser.add_argument('--fp16_allreduce', default=False, action='store_true', help='horovod fp16_allreduce')
 
+best_acc1 = 0
+os.environ['MASTER_ADDR'] = '127.0.0.1'
+os.environ['MASTER_PORT'] = '29500'
 
 def main():
     args = parser.parse_args()
@@ -99,12 +127,13 @@ def main():
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
 
-    if args.dist_url == "env://" and args.world_size == -1:
+    if args.dist_url == "env://" and args.world_size == -1 and args.multiprocessing_distributed:
         args.world_size = int(os.environ["WORLD_SIZE"])
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
     ngpus_per_node = torch.cuda.device_count()
+
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
@@ -131,6 +160,13 @@ def main_worker(gpu, ngpus_per_node, args):
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
+       
+
+        os.environ.setdefault("NCCL_SOCKET_IFNAME", "^lo,docker")
+        print(os.environ.get("NCCL_SOCKET_IFNAME"))
+
+
+        print(args.dist_backend, args.dist_url, args.world_size, args.rank)
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
     # create model
@@ -150,7 +186,26 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> creating model '{}'".format(args.arch))
             model = models.__dict__[args.arch]()
 
-    if args.distributed:
+    optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
+    if args.use_horovod:
+        print('use horovod')
+        hvd.init()
+        torch.cuda.set_device(hvd.local_rank())
+        model = model.cuda(args.gpu)
+        
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        args.n_workers = int(args.n_workers / ngpus_per_node)
+        print(args.n_workers)
+        compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
+        # compression = hvd.Compression.none
+        optimizer = hvd.DistributedOptimizer(optimizer,
+                                             named_parameters=model.named_parameters(),
+                                             compression=compression)
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+
+    elif args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
@@ -161,7 +216,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int(args.workers / ngpus_per_node)
+            args.n_workers = int(args.n_workers / ngpus_per_node)
+            print(args.n_workers)
+            print('use DDP')
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             model.cuda()
@@ -171,20 +228,19 @@ def main_worker(gpu, ngpus_per_node, args):
     elif args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
+        
     else:
         # DataParallel will divide and allocate batch_size to all available GPUs
         if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
             model.features = torch.nn.DataParallel(model.features)
             model.cuda()
         else:
+            print('use DP')
+            model = model.cuda()
             model = torch.nn.DataParallel(model).cuda()
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -219,6 +275,7 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         image_size = args.image_size
 
+
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
@@ -228,14 +285,18 @@ def main_worker(gpu, ngpus_per_node, args):
             normalize,
         ]))
 
-    if args.distributed:
+    if args.use_horovod:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset,
+                                                                        num_replicas=hvd.size(),
+                                                                        rank=hvd.rank())
+    elif args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     else:
         train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.n_workers, pin_memory=True, sampler=train_sampler)
 
     val_transforms = transforms.Compose([
         transforms.Resize(image_size, interpolation=PIL.Image.BICUBIC),
@@ -248,13 +309,15 @@ def main_worker(gpu, ngpus_per_node, args):
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, val_transforms),
         batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
+        num_workers=args.n_workers, pin_memory=True)
 
     if args.evaluate:
         res = validate(val_loader, model, criterion, args)
         with open('res.txt', 'w') as f:
             print(res, file=f)
         return
+    
+    scaler = GradScaler()
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -262,10 +325,15 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        start_time = time.time()
+        train(train_loader, model, criterion, optimizer, scaler, epoch, args)
+        end_time = time.time()
+        with open('benchmarks_1209.txt', 'a') as f:
+            f.write('\texecution time per single epoch: ' + str(end_time - start_time) + '\n')
+        exit()
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, scaler, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -282,30 +350,40 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, scaler, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(len(train_loader), batch_time, data_time, losses, top1,
-                             top5, prefix="Epoch: [{}]".format(epoch))
+                                 top5, prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, data in enumerate(train_loader):
+        images, target = data
         # measure data loading time
         data_time.update(time.time() - end)
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
-        target = target.cuda(args.gpu, non_blocking=True)
+            target = target.cuda(args.gpu, non_blocking=True)
+        else:
+            images, target = images.cuda(), target.cuda()
+        
+        optimizer.zero_grad()
 
         # compute output
-        output = model(images)
-        loss = criterion(output, target)
+        if args.mixed_precision:
+            with autocast():
+                output = model(images, use_amp=True)
+                loss = criterion(output, target)
+        else:
+            output = model(images)
+            loss = criterion(output, target)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -314,9 +392,27 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        if args.mixed_precision:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if args.use_horovod:
+            optimizer.synchronize()
+            with optimizer.skip_synchronize():
+                if args.mixed_precision:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+        else:
+            if args.mixed_precision:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -324,29 +420,39 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.print(i)
+    
 
-
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, scaler, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(len(val_loader), batch_time, losses, top1, top5,
-                             prefix='Test: ')
+    progress = ProgressMeter(len(val_loader), batch_time, losses, top1,
+                                 top5, prefix='Test: ')
 
+    # print('len_val_loader:', len(val_loader))
     # switch to evaluate mode
     model.eval()
 
     with torch.no_grad():
         end = time.time()
-        for i, (images, target) in enumerate(val_loader):
+        for i, data in enumerate(val_loader):
+            images, target = data
+
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
+            else:
+                images = images.cuda(non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
-            output = model(images)
-            loss = criterion(output, target)
+            if args.mixed_precision:
+                with autocast():
+                    output = model(images, use_amp=True)
+                    loss = criterion(output, target)
+            else:
+                output = model(images)
+                loss = criterion(output, target)
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -360,6 +466,7 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.print(i)
+
 
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
@@ -434,7 +541,7 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
